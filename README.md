@@ -1,7 +1,7 @@
 # Take Your Token Receipt
 <div align="center">
     <img src="imgs/claude-receipt-priced.png" width="45%">
-    <img src="imgs/codex-receipt-priced.png" width="42.91%">
+    <img src="imgs/codex-receipt-priced.png" width="43.91%">
 </div>
 
 `Take Your Token Receipt` is a tiny CLI that prints receipt-style token usage summaries from local Codex and Claude Code sessions.
