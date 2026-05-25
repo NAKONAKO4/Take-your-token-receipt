@@ -1,0 +1,21 @@
+{
+  "name": "take-your-token-receipt",
+  "version": "0.1.0",
+  "description": "Print receipt-style token usage summaries from local Codex sessions.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "tytr": "./bin/tytr.mjs",
+    "token-receipt": "./bin/tytr.mjs"
+  },
+  "scripts": {
+    "start": "node bin/tytr.mjs",
+    "receipt": "node bin/tytr.mjs",
+    "receipt:all": "node bin/tytr.mjs --all",
+    "receipt:json": "node bin/tytr.mjs --json",
+    "receipt:priced": "node bin/tytr.mjs --input-rate 5 --output-rate 15",
+    "receipt:save": "node bin/tytr.mjs --save receipt.txt",
+    "receipt:pdf": "node bin/tytr.mjs --pdf receipt.pdf",
+    "check": "node --check bin/tytr.mjs"
+  }
+}
