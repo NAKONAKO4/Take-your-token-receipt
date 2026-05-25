@@ -1,13 +1,21 @@
 #!/usr/bin/env node
 
-import { readdir, readFile, writeFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { deflateSync, inflateSync } from "node:zlib";
 
 const DEFAULT_CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
+const DEFAULT_CLAUDE_CODE_SESSIONS_DIR = join(homedir(), ".claude", "projects");
 const DEFAULT_AGENT = "Codex";
 const DEFAULT_TITLE_WIDTH = 19;
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const ICON_PATHS = {
+  codex: resolve(PROJECT_ROOT, "icons", "codex.png"),
+  claude: resolve(PROJECT_ROOT, "icons", "claudecode-color.png"),
+};
 const PRODUCT_NAME = "Take Your Token Receipt";
 
 const args = parseArgs(process.argv.slice(2));
@@ -23,16 +31,18 @@ async function main() {
     return;
   }
 
-  const sessionsDir = args.sessionsDir || process.env.CODEX_SESSIONS_DIR || DEFAULT_CODEX_SESSIONS_DIR;
-  const sessions = await readCodexSessions(sessionsDir);
+  const sessionsDir = args.sessionsDir || defaultSessionsDirFor(args.provider);
+  const sessions = await readAgentSessions(args.provider, sessionsDir);
 
   if (sessions.length === 0) {
-    throw new Error(`no Codex session files found in ${sessionsDir}`);
+    throw new Error(`no ${agentNameFor(args.provider)} session files found in ${sessionsDir}`);
   }
 
   const selectedSessions = args.all ? sessions : [sessions.at(-1)];
   const report = buildReport(selectedSessions, {
-    agent: args.agent || DEFAULT_AGENT,
+    agent: args.agent || agentNameFor(args.provider),
+    provider: args.provider,
+    all: args.all,
     inputRate: args.inputRate,
     outputRate: args.outputRate,
   });
@@ -43,7 +53,7 @@ async function main() {
   }
 
   if (args.pdf) {
-    await writeFile(resolve(args.pdf), renderReceiptPdf(receipt));
+    await writeFile(resolve(args.pdf), await renderReceiptPdf(receipt, { iconPath: iconPathFor(args.provider) }));
   }
 
   if (args.json) {
@@ -63,6 +73,7 @@ function parseArgs(argv) {
     save: "",
     sessionsDir: "",
     agent: "",
+    provider: "codex",
     inputRate: 0,
     outputRate: 0,
     titleWidth: DEFAULT_TITLE_WIDTH,
@@ -77,16 +88,45 @@ function parseArgs(argv) {
     else if (arg === "--json") parsed.json = true;
     else if (arg === "--pdf") parsed.pdf = requireValue(argv, (index += 1), "--pdf");
     else if (arg === "--save") parsed.save = requireValue(argv, (index += 1), "--save");
+    else if (arg === "--provider") parsed.provider = normalizeProvider(requireValue(argv, (index += 1), "--provider"));
     else if (arg === "--sessions-dir") parsed.sessionsDir = requireValue(argv, (index += 1), "--sessions-dir");
     else if (arg === "--agent") parsed.agent = requireValue(argv, (index += 1), "--agent");
     else if (arg === "--input-rate") parsed.inputRate = numberValue(argv, (index += 1), "--input-rate");
     else if (arg === "--output-rate") parsed.outputRate = numberValue(argv, (index += 1), "--output-rate");
     else if (arg === "--title-width") parsed.titleWidth = numberValue(argv, (index += 1), "--title-width");
-    else if (arg === "codex") continue;
+    else if (isProviderName(arg)) parsed.provider = normalizeProvider(arg);
     else throw new Error(`unknown option: ${arg}`);
   }
 
   return parsed;
+}
+
+function isProviderName(value) {
+  const normalized = value.toLowerCase();
+  return ["codex", "openai", "claude", "claudecode", "claude-code"].includes(normalized);
+}
+
+function normalizeProvider(value) {
+  const normalized = value.toLowerCase();
+  if (normalized === "codex" || normalized === "openai") return "codex";
+  if (normalized === "claude" || normalized === "claudecode" || normalized === "claude-code") return "claude";
+  throw new Error(`unknown provider: ${value}`);
+}
+
+function defaultSessionsDirFor(provider) {
+  if (provider === "claude") {
+    return process.env.CLAUDE_CODE_SESSIONS_DIR || process.env.CLAUDE_CODE_PROJECTS_DIR || DEFAULT_CLAUDE_CODE_SESSIONS_DIR;
+  }
+
+  return process.env.CODEX_SESSIONS_DIR || DEFAULT_CODEX_SESSIONS_DIR;
+}
+
+function agentNameFor(provider) {
+  return provider === "claude" ? "Claude Code" : DEFAULT_AGENT;
+}
+
+function iconPathFor(provider) {
+  return ICON_PATHS[provider] || ICON_PATHS.codex;
 }
 
 function requireValue(argv, index, option) {
@@ -111,6 +151,25 @@ async function readCodexSessions(sessionsDir) {
 
   for (const filePath of files) {
     const session = await parseCodexSession(filePath);
+    if (session.turns.length > 0) {
+      sessions.push(session);
+    }
+  }
+
+  return sessions.sort((a, b) => new Date(a.updatedAt) - new Date(b.updatedAt));
+}
+
+async function readAgentSessions(provider, sessionsDir) {
+  if (provider === "claude") return readClaudeCodeSessions(sessionsDir);
+  return readCodexSessions(sessionsDir);
+}
+
+async function readClaudeCodeSessions(sessionsDir) {
+  const files = await collectJsonlFiles(sessionsDir);
+  const sessions = [];
+
+  for (const filePath of files) {
+    const session = await parseClaudeCodeSession(filePath);
     if (session.turns.length > 0) {
       sessions.push(session);
     }
@@ -197,6 +256,65 @@ async function parseCodexSession(filePath) {
   };
 }
 
+async function parseClaudeCodeSession(filePath) {
+  const fileStat = await stat(filePath);
+  const content = await readFile(filePath, "utf8");
+  const usageByMessage = new Map();
+  let title = "";
+  let updatedAt = fileStat.mtime.toISOString();
+  let model = "";
+
+  content.split(/\r?\n/).forEach((line, lineIndex) => {
+    if (!line.trim()) return;
+
+    try {
+      const event = JSON.parse(line);
+      const message = event.message ?? {};
+
+      if (!title && event.type === "user") {
+        title = firstLine(textFromClaudeContent(message.content));
+      }
+
+      if (typeof event.aiTitle === "string" && event.aiTitle.trim()) {
+        title = event.aiTitle.trim();
+      }
+
+      if (event.timestamp) {
+        updatedAt = event.timestamp;
+      }
+
+      if (typeof message.model === "string" && message.model.trim()) {
+        model = message.model.trim();
+      }
+
+      if (event.type !== "assistant" || !message.usage) return;
+
+      const messageId = message.id || event.uuid || `${filePath}:${lineIndex}`;
+      usageByMessage.set(messageId, {
+        id: messageId,
+        timestamp: event.timestamp || updatedAt,
+        usage: claudeUsageFrom(message.usage),
+      });
+    } catch {
+      // Claude Code can be writing the latest JSONL line while we read it.
+    }
+  });
+
+  const turns = Array.from(usageByMessage.values()).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  const cumulativeUsage = turns.reduce((sum, turn) => addUsage(sum, turn.usage), emptyUsage());
+
+  return {
+    filePath,
+    fileName: basename(filePath),
+    title: title || titleFromFile(filePath, "Claude Code session"),
+    updatedAt,
+    model,
+    limitName: "",
+    turns,
+    cumulativeUsage,
+  };
+}
+
 function firstLine(text) {
   return String(text ?? "")
     .trim()
@@ -205,8 +323,8 @@ function firstLine(text) {
     ?.slice(0, 80);
 }
 
-function titleFromFile(filePath) {
-  return basename(filePath).replace(/^rollout-/, "").replace(/\.jsonl$/, "") || "Codex session";
+function titleFromFile(filePath, fallback = "Codex session") {
+  return basename(filePath).replace(/^rollout-/, "").replace(/\.jsonl$/, "") || fallback;
 }
 
 function usageFrom(raw) {
@@ -217,6 +335,40 @@ function usageFrom(raw) {
     reasoningOutputTokens: toInt(raw?.reasoning_output_tokens),
     totalTokens: toInt(raw?.total_tokens),
   };
+}
+
+function claudeUsageFrom(raw) {
+  const nestedCacheCreationInputTokens = toInt(raw?.cache_creation?.ephemeral_1h_input_tokens) + toInt(raw?.cache_creation?.ephemeral_5m_input_tokens);
+  const topLevelCacheCreationInputTokens = toInt(raw?.cache_creation_input_tokens);
+  const cacheCreationInputTokens = topLevelCacheCreationInputTokens || nestedCacheCreationInputTokens;
+  const cachedInputTokens = toInt(raw?.cache_read_input_tokens);
+  const directInputTokens = toInt(raw?.input_tokens);
+  const outputTokens = toInt(raw?.output_tokens);
+  const reasoningOutputTokens = toInt(raw?.reasoning_output_tokens ?? raw?.thinking_output_tokens);
+  const inputTokens = directInputTokens + cacheCreationInputTokens + cachedInputTokens;
+
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+    totalTokens: inputTokens + outputTokens + reasoningOutputTokens,
+  };
+}
+
+function textFromClaudeContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (typeof part?.text === "string") return part.text;
+      if (typeof part?.content === "string") return part.content;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
 }
 
 function emptyUsage() {
@@ -240,6 +392,8 @@ function buildReport(sessions, options) {
 
   return {
     agent: options.agent,
+    provider: options.provider,
+    mode: options.all ? "all" : "latest",
     logo: logoFor(options.agent),
     generatedAt: new Date().toISOString(),
     sessions: sessions.map((session) => ({
@@ -282,6 +436,16 @@ function logoFor(agent) {
     ];
   }
 
+  if (normalized.includes("claude")) {
+    return [
+      "   ____ _                 _      ",
+      "  / ___| | __ _ _   _  __| | ___ ",
+      " | |   | |/ _` | | | |/ _` |/ _ \\",
+      " | |___| | (_| | |_| | (_| |  __/",
+      "  \\____|_|\\__,_|\\__,_|\\__,_|\\___|",
+    ];
+  }
+
   return [
     "     _    ___ ",
     "    / \\  |_ _|",
@@ -291,18 +455,24 @@ function logoFor(agent) {
   ];
 }
 
+function centerLine(text, width = 40) {
+  const value = String(text);
+  const left = Math.max(0, Math.floor((width - value.length) / 2));
+  return `${" ".repeat(left)}${value}`;
+}
+
 function renderReceipt(report) {
   const lines = [];
   const latest = report.sessions.at(-1);
 
   lines.push("========================================");
-  lines.push("       TAKE YOUR TOKEN RECEIPT");
+  lines.push(centerLine("TAKE YOUR TOKEN RECEIPT"));
   lines.push("========================================");
   report.logo.forEach((line) => lines.push(line));
   lines.push("----------------------------------------");
   lines.push(`Agent: ${report.agent}`);
   lines.push(`Generated: ${formatDate(report.generatedAt)}`);
-  lines.push(`Mode: ${report.sessions.length === 1 ? "latest Codex session" : "all Codex sessions"}`);
+  lines.push(`Mode: ${report.mode === "all" ? `all ${report.agent} sessions` : `latest ${report.agent} session`}`);
   if (latest?.model) lines.push(`Model: ${latest.model}`);
   if (latest?.limitName) lines.push(`Limit bucket: ${latest.limitName}`);
   lines.push("----------------------------------------");
@@ -315,11 +485,14 @@ function renderReceipt(report) {
   lines.push(`Total tokens: ${formatNumber(report.totals.totalTokens)}`);
 
   if (report.pricing.inputRatePerMillion > 0 || report.pricing.outputRatePerMillion > 0) {
+    lines.push(`Input rate: $${formatMoney(report.pricing.inputRatePerMillion)}/1M`);
+    lines.push(`Output rate: $${formatMoney(report.pricing.outputRatePerMillion)}/1M`);
     lines.push(`Estimated cost: $${report.pricing.estimatedCostUsd.toFixed(4)}`);
   }
 
   lines.push("----------------------------------------");
-  report.sessions.slice(-8).forEach((session, index) => {
+  const receiptSessions = report.mode === "all" ? report.sessions : report.sessions.slice(-8);
+  receiptSessions.forEach((session, index) => {
     const titleLines = wrapText(session.title, args.titleWidth);
     const prefix = `${String(index + 1).padStart(2, "0")}. `;
     lines.push(`${prefix}${titleLines[0] ?? "Untitled Codex session"}`);
@@ -335,14 +508,17 @@ function renderReceipt(report) {
   return lines.join("\n");
 }
 
-function renderReceiptPdf(receipt) {
+async function renderReceiptPdf(receipt, options = {}) {
   const lines = receipt.split("\n");
   const pageWidth = 226.77; // 80mm thermal receipt width in PDF points.
   const fontSize = 7.6;
   const lineHeight = 9.8;
   const marginX = 16;
   const marginY = 18;
-  const pageHeight = Math.max(300, marginY * 2 + lines.length * lineHeight);
+  const icon = await readPngIcon(options.iconPath);
+  const iconSize = icon ? 32 : 0;
+  const iconGap = icon ? 4 : 0;
+  const pageHeight = Math.max(300, marginY * 2 + iconSize + iconGap + lines.length * lineHeight);
   let y = pageHeight - marginY - fontSize;
 
   const content = [];
@@ -351,6 +527,15 @@ function renderReceiptPdf(receipt) {
   content.push(`0 0 ${fixed(pageWidth)} ${fixed(pageHeight)} re f`);
   content.push("Q");
   content.push("0.08 0.07 0.06 rg");
+
+  if (icon) {
+    content.push(renderPngImage("Icon", {
+      x: (pageWidth - iconSize) / 2,
+      y: pageHeight - marginY - iconSize,
+      size: iconSize,
+    }));
+    y -= iconSize + iconGap;
+  }
 
   lines.forEach((line) => {
     const fontName = hasNonAscii(line) ? "FCjk" : "FMono";
@@ -363,39 +548,202 @@ function renderReceiptPdf(receipt) {
     pageWidth,
     pageHeight,
     content: content.join("\n"),
+    images: icon ? [{ name: "Icon", ...icon }] : [],
   });
 }
 
-function buildPdf({ pageWidth, pageHeight, content }) {
+async function readPngIcon(iconPath) {
+  if (!iconPath || !existsSync(iconPath)) return null;
+
+  try {
+    const image = decodePng(await readFile(iconPath));
+    return {
+      width: image.width,
+      height: image.height,
+      compressedRgb: deflateSync(image.rgb),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function renderPngImage(name, placement) {
+  return [
+    "q",
+    `${fixed(placement.size)} 0 0 ${fixed(placement.size)} ${fixed(placement.x)} ${fixed(placement.y)} cm`,
+    `/${name} Do`,
+    "Q",
+  ].join("\n");
+}
+
+function decodePng(buffer) {
+  const signature = "89504e470d0a1a0a";
+  if (buffer.subarray(0, 8).toString("hex") !== signature) {
+    throw new Error("invalid PNG signature");
+  }
+
+  let offset = 8;
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  let interlace = 0;
+  const idat = [];
+  let palette = [];
+  let transparency = Buffer.alloc(0);
+
+  while (offset < buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.subarray(offset + 4, offset + 8).toString("ascii");
+    const data = buffer.subarray(offset + 8, offset + 8 + length);
+    offset += 12 + length;
+
+    if (type === "IHDR") {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      bitDepth = data[8];
+      colorType = data[9];
+      interlace = data[12];
+    } else if (type === "PLTE") {
+      palette = [];
+      for (let index = 0; index < data.length; index += 3) {
+        palette.push([data[index], data[index + 1], data[index + 2]]);
+      }
+    } else if (type === "tRNS") {
+      transparency = data;
+    } else if (type === "IDAT") {
+      idat.push(data);
+    } else if (type === "IEND") {
+      break;
+    }
+  }
+
+  if (bitDepth !== 8 || interlace !== 0) {
+    throw new Error("only 8-bit non-interlaced PNG icons are supported");
+  }
+
+  const channels = pngChannels(colorType);
+  const rowLength = width * channels;
+  const inflated = inflateSync(Buffer.concat(idat));
+  const raw = Buffer.alloc(width * height * channels);
+  const rgb = Buffer.alloc(width * height * 3);
+  const paper = [251, 249, 240];
+  let sourceOffset = 0;
+
+  for (let row = 0; row < height; row += 1) {
+    const filter = inflated[sourceOffset++];
+    const rowStart = row * rowLength;
+
+    for (let column = 0; column < rowLength; column += 1) {
+      const left = column >= channels ? raw[rowStart + column - channels] : 0;
+      const up = row > 0 ? raw[rowStart + column - rowLength] : 0;
+      const upLeft = row > 0 && column >= channels ? raw[rowStart + column - rowLength - channels] : 0;
+      const value = inflated[sourceOffset++];
+      raw[rowStart + column] = (value + pngPredictor(filter, left, up, upLeft)) & 0xff;
+    }
+  }
+
+  for (let pixel = 0; pixel < width * height; pixel += 1) {
+    const source = pixel * channels;
+    const target = pixel * 3;
+    const rgba = pngPixel(raw, source, colorType, palette, transparency);
+    const alpha = rgba[3] / 255;
+    rgb[target] = Math.round(rgba[0] * alpha + paper[0] * (1 - alpha));
+    rgb[target + 1] = Math.round(rgba[1] * alpha + paper[1] * (1 - alpha));
+    rgb[target + 2] = Math.round(rgba[2] * alpha + paper[2] * (1 - alpha));
+  }
+
+  return { width, height, rgb };
+}
+
+function pngChannels(colorType) {
+  if (colorType === 0) return 1;
+  if (colorType === 2) return 3;
+  if (colorType === 3) return 1;
+  if (colorType === 4) return 2;
+  if (colorType === 6) return 4;
+  throw new Error(`unsupported PNG color type: ${colorType}`);
+}
+
+function pngPixel(raw, offset, colorType, palette, transparency) {
+  if (colorType === 0) return [raw[offset], raw[offset], raw[offset], 255];
+  if (colorType === 2) return [raw[offset], raw[offset + 1], raw[offset + 2], 255];
+  if (colorType === 3) {
+    const index = raw[offset];
+    const color = palette[index] || [0, 0, 0];
+    return [color[0], color[1], color[2], transparency[index] ?? 255];
+  }
+  if (colorType === 4) return [raw[offset], raw[offset], raw[offset], raw[offset + 1]];
+  return [raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3]];
+}
+
+function pngPredictor(filter, left, up, upLeft) {
+  if (filter === 0) return 0;
+  if (filter === 1) return left;
+  if (filter === 2) return up;
+  if (filter === 3) return Math.floor((left + up) / 2);
+  if (filter === 4) return paeth(left, up, upLeft);
+  throw new Error(`unsupported PNG filter: ${filter}`);
+}
+
+function paeth(left, up, upLeft) {
+  const estimate = left + up - upLeft;
+  const leftDistance = Math.abs(estimate - left);
+  const upDistance = Math.abs(estimate - up);
+  const upLeftDistance = Math.abs(estimate - upLeft);
+  if (leftDistance <= upDistance && leftDistance <= upLeftDistance) return left;
+  if (upDistance <= upLeftDistance) return up;
+  return upLeft;
+}
+
+function buildPdf({ pageWidth, pageHeight, content, images = [] }) {
+  const xObjectResources = images.length > 0
+    ? ` /XObject << ${images.map((image, index) => `/${image.name} ${index + 9} 0 R`).join(" ")} >>`
+    : "";
   const objects = [
     "<< /Type /Catalog /Pages 2 0 R >>",
     "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${fixed(pageWidth)} ${fixed(pageHeight)}] /Resources << /Font << /FMono 5 0 R /FCjk 6 0 R >> >> /Contents 4 0 R >>`,
-    `<< /Length ${Buffer.byteLength(content, "utf8")} >>\nstream\n${content}\nendstream`,
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${fixed(pageWidth)} ${fixed(pageHeight)}] /Resources << /Font << /FMono 5 0 R /FCjk 6 0 R >>${xObjectResources} >> /Contents 4 0 R >>`,
+    pdfStream(Buffer.from(content, "utf8")),
     "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
     "<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H /DescendantFonts [7 0 R] >>",
     "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> /FontDescriptor 8 0 R >>",
     "<< /Type /FontDescriptor /FontName /STSong-Light /Flags 4 /FontBBox [0 -120 1000 880] /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 700 /StemV 80 >>",
+    ...images.map((image) => pdfStream(image.compressedRgb, ` /Type /XObject /Subtype /Image /Width ${image.width} /Height ${image.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode`)),
   ];
 
-  const chunks = ["%PDF-1.4\n%\xFF\xFF\xFF\xFF\n"];
+  const chunks = [Buffer.from("%PDF-1.4\n%\xFF\xFF\xFF\xFF\n", "binary")];
   const offsets = [0];
 
   objects.forEach((object, index) => {
-    offsets.push(Buffer.byteLength(chunks.join(""), "binary"));
-    chunks.push(`${index + 1} 0 obj\n${object}\nendobj\n`);
+    offsets.push(bufferLength(chunks));
+    chunks.push(Buffer.from(`${index + 1} 0 obj\n`, "utf8"));
+    chunks.push(Buffer.isBuffer(object) ? object : Buffer.from(object, "utf8"));
+    chunks.push(Buffer.from("\nendobj\n", "utf8"));
   });
 
-  const xrefOffset = Buffer.byteLength(chunks.join(""), "binary");
-  chunks.push(`xref\n0 ${objects.length + 1}\n`);
-  chunks.push("0000000000 65535 f \n");
+  const xrefOffset = bufferLength(chunks);
+  chunks.push(Buffer.from(`xref\n0 ${objects.length + 1}\n`, "utf8"));
+  chunks.push(Buffer.from("0000000000 65535 f \n", "utf8"));
   offsets.slice(1).forEach((offset) => {
-    chunks.push(`${String(offset).padStart(10, "0")} 00000 n \n`);
+    chunks.push(Buffer.from(`${String(offset).padStart(10, "0")} 00000 n \n`, "utf8"));
   });
-  chunks.push(`trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\n`);
-  chunks.push(`startxref\n${xrefOffset}\n%%EOF\n`);
+  chunks.push(Buffer.from(`trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\n`, "utf8"));
+  chunks.push(Buffer.from(`startxref\n${xrefOffset}\n%%EOF\n`, "utf8"));
 
-  return Buffer.from(chunks.join(""), "binary");
+  return Buffer.concat(chunks);
+}
+
+function pdfStream(data, dictionary = "") {
+  return Buffer.concat([
+    Buffer.from(`<<${dictionary} /Length ${data.length} >>\nstream\n`, "utf8"),
+    data,
+    Buffer.from("\nendstream", "utf8"),
+  ]);
+}
+
+function bufferLength(chunks) {
+  return chunks.reduce((sum, chunk) => sum + chunk.length, 0);
 }
 
 function fixed(value) {
@@ -446,20 +794,28 @@ function formatNumber(value) {
   return new Intl.NumberFormat("en-US").format(value);
 }
 
+function formatMoney(value) {
+  return Number(value).toLocaleString("en-US", {
+    maximumFractionDigits: 4,
+    minimumFractionDigits: Number.isInteger(value) ? 0 : 2,
+  });
+}
+
 function helpText() {
   return `
 ${PRODUCT_NAME}
 
 Usage:
-  tytr [codex] [options]
-  token-receipt [codex] [options]
-  node bin/tytr.mjs [codex] [options]
+  tytr [codex|claude] [options]
+  token-receipt [codex|claude] [options]
+  node bin/tytr.mjs [codex|claude] [options]
 
 Options:
-  --latest                  Print the latest Codex session receipt (default)
-  --all                     Aggregate all local Codex sessions
-  --sessions-dir <path>     Read Codex JSONL sessions from a custom directory
-  --agent <name>            Agent name shown on the receipt (default: Codex)
+  --latest                  Print the latest selected agent session receipt (default)
+  --all                     Aggregate all selected agent sessions
+  --provider <name>         Read from codex or claude logs
+  --sessions-dir <path>     Read JSONL sessions from a custom directory
+  --agent <name>            Agent name shown on the receipt
   --input-rate <usd>        Input price per 1M tokens, used only for cost estimate
   --output-rate <usd>       Output price per 1M tokens, used only for cost estimate
   --title-width <chars>     Session title width before wrapping/truncation (default: ${DEFAULT_TITLE_WIDTH})
@@ -470,9 +826,13 @@ Options:
 
 Examples:
   tytr
+  tytr claude
   tytr --all
+  tytr --all --pdf receipt-all.pdf
   tytr --save receipt.txt
   tytr --pdf receipt.pdf
+  tytr claude --pdf claude-receipt.pdf
   tytr --input-rate 5 --output-rate 15
+  tytr claude --input-rate 5 --output-rate 15 --pdf claude-priced.pdf
 `.trim();
 }
