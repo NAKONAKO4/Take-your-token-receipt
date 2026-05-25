@@ -1,7 +1,7 @@
 {
   "name": "take-your-token-receipt",
   "version": "0.1.0",
-  "description": "Print receipt-style token usage summaries from local Codex sessions.",
+  "description": "Print receipt-style token usage summaries from local Codex and Claude Code sessions.",
   "type": "module",
   "private": true,
   "bin": {
@@ -12,8 +12,16 @@
     "start": "node bin/tytr.mjs",
     "receipt": "node bin/tytr.mjs",
     "receipt:all": "node bin/tytr.mjs --all",
+    "receipt:all:pdf": "node bin/tytr.mjs --all --pdf receipt-all.pdf",
+    "receipt:claude": "node bin/tytr.mjs claude",
+    "receipt:claude:all": "node bin/tytr.mjs claude --all",
+    "receipt:claude:all:pdf": "node bin/tytr.mjs claude --all --pdf claude-receipt-all.pdf",
+    "receipt:claude:pdf": "node bin/tytr.mjs claude --pdf claude-receipt.pdf",
+    "receipt:claude:priced": "node bin/tytr.mjs claude --input-rate 5 --output-rate 15",
+    "receipt:claude:priced:pdf": "node bin/tytr.mjs claude --input-rate 5 --output-rate 15 --pdf claude-receipt-priced.pdf",
     "receipt:json": "node bin/tytr.mjs --json",
     "receipt:priced": "node bin/tytr.mjs --input-rate 5 --output-rate 15",
+    "receipt:priced:pdf": "node bin/tytr.mjs --input-rate 5 --output-rate 15 --pdf receipt-priced.pdf",
     "receipt:save": "node bin/tytr.mjs --save receipt.txt",
     "receipt:pdf": "node bin/tytr.mjs --pdf receipt.pdf",
     "check": "node --check bin/tytr.mjs"
