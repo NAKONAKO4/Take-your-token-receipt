@@ -10,7 +10,7 @@ import { deflateSync, inflateSync } from "node:zlib";
 const DEFAULT_CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 const DEFAULT_CLAUDE_CODE_SESSIONS_DIR = join(homedir(), ".claude", "projects");
 const DEFAULT_AGENT = "Codex";
-const DEFAULT_TITLE_WIDTH = 19;
+const DEFAULT_TITLE_WIDTH = 40;
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ICON_PATHS = {
   codex: resolve(PROJECT_ROOT, "icons", "codex.png"),
