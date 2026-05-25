@@ -6,8 +6,6 @@
 
 `Take Your Token Receipt` is a tiny CLI that prints receipt-style token usage summaries from local Codex and Claude Code sessions.
 
-Codex writes local sessions to `~/.codex/sessions/**/*.jsonl`. Claude Code writes project sessions to `~/.claude/projects/**/*.jsonl`. This tool reads those files directly, so there is no browser UI, local HTTP server, or manual token entry.
-
 ## Quick Start
 
 Run the latest-session receipt:
